@@ -534,8 +534,8 @@ final class WindowFrameRecorder {
         CVPixelBufferLockBaseAddress(buffer, [])
         let data = CVPixelBufferGetBaseAddress(buffer)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
 
         if let context = CGContext(
             data: data,
