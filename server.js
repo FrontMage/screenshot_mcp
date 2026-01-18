@@ -66,12 +66,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "record_window_duration",
-      description: "Record a window for a fixed duration (seconds) to an MP4.",
+      description:
+        "Record a window for a fixed duration (seconds) to an MP4. fps defaults to 10.",
       inputSchema: {
         type: "object",
         properties: {
           window_id: { type: "integer" },
           duration_seconds: { type: "number" },
+          fps: { type: "integer" },
           output_path: { type: "string" },
         },
         required: ["window_id", "duration_seconds"],
@@ -81,11 +83,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "record_window_start",
       description:
-        "Start recording a window until record_window_stop is called.",
+        "Start recording a window until record_window_stop is called. fps defaults to 10.",
       inputSchema: {
         type: "object",
         properties: {
           window_id: { type: "integer" },
+          fps: { type: "integer" },
           output_path: { type: "string" },
         },
         required: ["window_id"],
@@ -162,17 +165,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
         throw new Error("duration_seconds must be a positive number.");
       }
+      const fps = parseOptionalPositiveInt(args?.fps, "fps");
       const outputPath =
         typeof args?.output_path === "string" && args.output_path.length > 0
           ? args.output_path
           : defaultOutputPath(`window_${windowId}`, "mp4");
       await ensureOutputDir(outputPath);
-      await runCli([
+      const cliArgs = [
         "record-window-duration",
         String(windowId),
         outputPath,
         String(durationSeconds),
-      ]);
+      ];
+      if (fps !== null) {
+        cliArgs.push(String(fps));
+      }
+      await runCli(cliArgs);
       return {
         content: [
           { type: "text", text: JSON.stringify({ output_path: outputPath }) },
@@ -184,17 +192,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!Number.isInteger(windowId)) {
         throw new Error("window_id must be an integer.");
       }
+      const fps = parseOptionalPositiveInt(args?.fps, "fps");
       const outputPath =
         typeof args?.output_path === "string" && args.output_path.length > 0
           ? args.output_path
           : defaultOutputPath(`window_${windowId}`, "mp4");
       await ensureOutputDir(outputPath);
       const recordingId = createRecordingId();
-      const child = spawn(
-        BIN_PATH,
-        ["record-window-start", String(windowId), outputPath],
-        { stdio: "ignore" }
-      );
+      const cliArgs = ["record-window-start", String(windowId), outputPath];
+      if (fps !== null) {
+        cliArgs.push(String(fps));
+      }
+      const child = spawn(BIN_PATH, cliArgs, { stdio: "ignore" });
       activeRecordings.set(recordingId, { child, outputPath });
       child.once("exit", () => {
         activeRecordings.delete(recordingId);
@@ -269,6 +278,17 @@ function execFileAsync(command, args) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+function parseOptionalPositiveInt(value, name) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
 }
 
 function createRecordingId() {

@@ -37,6 +37,8 @@ struct Rect: Codable {
     let height: Double
 }
 
+private let defaultRecordingFps = 10
+
 @main
 struct ScreenshotMcpCLI {
     static func main() async {
@@ -77,12 +79,14 @@ struct ScreenshotMcpCLI {
             let windowId = try parseUInt32(args[1], name: "window_id")
             let outputPath = args[2]
             let durationSeconds = try parseDouble(args[3], name: "duration_seconds")
-            try await recordWindow(windowId: windowId, outputPath: outputPath, durationSeconds: durationSeconds)
+            let fps = try parseOptionalInt(args: args, index: 4, name: "fps") ?? defaultRecordingFps
+            try await recordWindow(windowId: windowId, outputPath: outputPath, durationSeconds: durationSeconds, fps: fps)
         case "record-window-start":
             guard args.count >= 3 else { printUsageAndExit() }
             let windowId = try parseUInt32(args[1], name: "window_id")
             let outputPath = args[2]
-            try await recordWindow(windowId: windowId, outputPath: outputPath, durationSeconds: nil)
+            let fps = try parseOptionalInt(args: args, index: 3, name: "fps") ?? defaultRecordingFps
+            try await recordWindow(windowId: windowId, outputPath: outputPath, durationSeconds: nil, fps: fps)
         default:
             printUsage()
             exit(1)
@@ -98,8 +102,8 @@ private func printUsage() {
           screenshot_mcp list-windows
           screenshot_mcp screenshot-display <display_id> <output_path>
           screenshot_mcp screenshot-window <window_id> <output_path>
-          screenshot_mcp record-window-duration <window_id> <output_path> <duration_seconds>
-          screenshot_mcp record-window-start <window_id> <output_path>
+          screenshot_mcp record-window-duration <window_id> <output_path> <duration_seconds> [fps]
+          screenshot_mcp record-window-start <window_id> <output_path> [fps]
         """
     )
 }
@@ -264,24 +268,37 @@ private func outputUTI(for url: URL) -> CFString {
     }
 }
 
-private func recordWindow(windowId: UInt32, outputPath: String, durationSeconds: Double?) async throws {
+private func recordWindow(windowId: UInt32, outputPath: String, durationSeconds: Double?, fps: Int) async throws {
     guard #available(macOS 12.3, *) else {
         throw CLIError("Window recording requires macOS 12.3 or newer.")
     }
     if let durationSeconds = durationSeconds, durationSeconds <= 0 {
         throw CLIError("duration_seconds must be greater than 0.")
     }
+    if fps <= 0 {
+        throw CLIError("fps must be greater than 0.")
+    }
 
-    try await recordWindowAvailable(windowId: windowId, outputPath: outputPath, durationSeconds: durationSeconds)
+    try await recordWindowAvailable(
+        windowId: windowId,
+        outputPath: outputPath,
+        durationSeconds: durationSeconds,
+        fps: fps
+    )
 }
 
 @available(macOS 12.3, *)
-private func recordWindowAvailable(windowId: UInt32, outputPath: String, durationSeconds: Double?) async throws {
+private func recordWindowAvailable(
+    windowId: UInt32,
+    outputPath: String,
+    durationSeconds: Double?,
+    fps: Int
+) async throws {
     let url = URL(fileURLWithPath: outputPath)
     let dirUrl = url.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: dirUrl, withIntermediateDirectories: true, attributes: nil)
 
-    let recorder = WindowFrameRecorder(windowId: CGWindowID(windowId), outputURL: url, fps: 10)
+    let recorder = WindowFrameRecorder(windowId: CGWindowID(windowId), outputURL: url, fps: fps)
     let signalWatcher = SignalWatcher {
         recorder.requestStop()
     }
@@ -316,6 +333,15 @@ private func parseUInt32(_ value: String, name: String) throws -> UInt32 {
 
 private func parseDouble(_ value: String, name: String) throws -> Double {
     guard let parsed = Double(value) else {
+        throw CLIError("Invalid \(name): \(value)")
+    }
+    return parsed
+}
+
+private func parseOptionalInt(args: [String], index: Int, name: String) throws -> Int? {
+    guard args.count > index else { return nil }
+    let value = args[index]
+    guard let parsed = Int(value) else {
         throw CLIError("Invalid \(name): \(value)")
     }
     return parsed
