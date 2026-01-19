@@ -47,3 +47,6 @@ swift run screenshot_mcp record-window-start <window_id> ./captures/window.mp4 1
 - The Swift CLI uses `CGDisplayCreateImage` and `CGWindowListCreateImage`.
 - Window recording samples window frames (default 10 fps) and writes MP4 via `AVAssetWriter`.
 - If screenshots are blank, ensure Screen Recording permission is granted.
+
+## License
+MIT
