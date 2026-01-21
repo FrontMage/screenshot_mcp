@@ -660,11 +660,28 @@ final class WindowFrameRecorder {
             AVEncoderBitRateKey: 128_000
         ]
 
-        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+        var audioInput = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: settings,
+            sourceFormatHint: formatDescription
+        )
         audioInput.expectsMediaDataInRealTime = true
 
+        if !writer.canAdd(audioInput) {
+            audioInput = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: nil,
+                sourceFormatHint: formatDescription
+            )
+            audioInput.expectsMediaDataInRealTime = true
+        }
+
         guard writer.canAdd(audioInput) else {
-            throw CLIError("Unable to add audio input to writer.")
+            let formatID = fourCC(asbd.mFormatID)
+            throw CLIError(
+                "Unable to add audio input to writer. format=\(formatID) " +
+                "sampleRate=\(asbd.mSampleRate) channels=\(asbd.mChannelsPerFrame)"
+            )
         }
         writer.add(audioInput)
         self.audioInput = audioInput
@@ -747,6 +764,22 @@ final class WindowFrameRecorder {
 
 @available(macOS 12.3, *)
 extension WindowFrameRecorder: @unchecked Sendable {}
+
+private func fourCC(_ code: UInt32) -> String {
+    let bytes: [UInt8] = [
+        UInt8((code >> 24) & 0xFF),
+        UInt8((code >> 16) & 0xFF),
+        UInt8((code >> 8) & 0xFF),
+        UInt8(code & 0xFF)
+    ]
+    return bytes.map { byte in
+        let scalar = UnicodeScalar(byte)
+        if scalar.isASCII && scalar.value >= 32 {
+            return Character(scalar)
+        }
+        return "?"
+    }.map(String.init).joined()
+}
 
 @available(macOS 13.0, *)
 final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {

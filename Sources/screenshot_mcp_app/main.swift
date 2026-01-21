@@ -283,13 +283,11 @@ final class DebugLogger {
     init() {
         let manager = FileManager.default
         let documents = manager.urls(for: .documentDirectory, in: .userDomainMask).first
-        let logDir = documents?.appendingPathComponent("screenshot_mcp")
-        let logFile = logDir?.appendingPathComponent("debug.log")
-        self.fileURL = logFile ?? URL(fileURLWithPath: "debug.log")
+            ?? manager.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
+        let logDir = documents.appendingPathComponent("screenshot_mcp")
+        self.fileURL = logDir.appendingPathComponent("debug.log")
 
-        if let logDir = logDir {
-            try? manager.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: nil)
-        }
+        try? manager.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: nil)
     }
 
     func info(_ message: String) {
