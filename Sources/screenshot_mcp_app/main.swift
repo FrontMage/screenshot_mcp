@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct WindowInfo: Identifiable, Decodable {
     let windowId: Int
     let ownerName: String?
+    let ownerPid: Int?
     let title: String?
 
     var id: Int { windowId }
@@ -83,6 +84,7 @@ final class RecorderViewModel: ObservableObject {
             isRecording = true
             status = "Recording..."
             logger.info("Recording started for window \(windowId) at \(fps) fps. Output: \(outputPath)")
+            focusSelectedWindow()
             process.terminationHandler = { [weak self] proc in
                 let outData = stdout.fileHandleForReading.readDataToEndOfFile()
                 let errData = stderr.fileHandleForReading.readDataToEndOfFile()
@@ -112,6 +114,21 @@ final class RecorderViewModel: ObservableObject {
         status = "Stopped"
         outputPath = RecorderViewModel.defaultOutputPath()
         logger.info("Recording stopped.")
+    }
+
+    private func focusSelectedWindow() {
+        guard let windowId = selectedWindowId else { return }
+        guard let window = windows.first(where: { $0.windowId == windowId }),
+              let pid = window.ownerPid else {
+            logger.error("Focus failed: missing pid for window \(windowId).")
+            return
+        }
+        if let app = NSRunningApplication(processIdentifier: pid_t(pid)) {
+            let activated = app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            logger.info("Focus window \(windowId) via pid \(pid): \(activated ? "ok" : "failed")")
+        } else {
+            logger.error("Focus failed: no running app for pid \(pid).")
+        }
     }
 
     @MainActor
