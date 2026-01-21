@@ -444,6 +444,8 @@ final class WindowFrameRecorder {
     private let outputURL: URL
     private let fps: Int
     private let captureQueue = DispatchQueue(label: "screenshot_mcp.window_capture")
+    private let writerQueue = DispatchQueue(label: "screenshot_mcp.writer")
+    private let audioQueue = DispatchQueue(label: "screenshot_mcp.window_audio")
     private let includeSystemAudio: Bool
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
@@ -489,7 +491,7 @@ final class WindowFrameRecorder {
 
         if includeSystemAudio {
             if #available(macOS 13.0, *) {
-                let audioCapture = SystemAudioCapture(queue: captureQueue) { [weak self] sampleBuffer in
+                let audioCapture = SystemAudioCapture(queue: audioQueue) { [weak self] sampleBuffer in
                     self?.handleAudioSample(sampleBuffer)
                 }
                 self.audioCapture = audioCapture
@@ -549,18 +551,15 @@ final class WindowFrameRecorder {
         if stopRequested {
             return
         }
-        if !writerStarted {
-            return
-        }
         guard let image = captureImage() else {
             return
         }
         if image.width != width || image.height != height {
             return
         }
-        let offset = CMTime(value: frameCount, timescale: CMTimeScale(fps))
-        let time = CMTimeAdd(baseTime, offset)
-        appendFrame(image: image, time: time)
+        writerQueue.async { [weak self] in
+            self?.appendFrameWithNextTime(image: image)
+        }
     }
 
     private func captureImage() -> CGImage? {
@@ -613,7 +612,20 @@ final class WindowFrameRecorder {
         frameCount += 1
     }
 
+    private func appendFrameWithNextTime(image: CGImage) {
+        guard writerStarted else { return }
+        let offset = CMTime(value: frameCount, timescale: CMTimeScale(fps))
+        let time = CMTimeAdd(baseTime, offset)
+        appendFrame(image: image, time: time)
+    }
+
     private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        writerQueue.async { [weak self] in
+            self?.handleAudioSampleOnWriter(sampleBuffer)
+        }
+    }
+
+    private func handleAudioSampleOnWriter(_ sampleBuffer: CMSampleBuffer) {
         if stopRequested {
             return
         }
@@ -632,7 +644,7 @@ final class WindowFrameRecorder {
 
         if !writerStarted {
             let startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            startWriterIfNeeded(at: startTime)
+            startWriterIfNeeded(at: startTime.isValid ? startTime : .zero)
             if let image = captureImage(), image.width == width, image.height == height {
                 appendInitialFrame(image: image)
             }
@@ -697,8 +709,7 @@ final class WindowFrameRecorder {
     }
 
     private func appendInitialFrame(image: CGImage) {
-        let time = baseTime
-        appendFrame(image: image, time: time)
+        appendFrame(image: image, time: baseTime)
     }
 
     private func setError(_ error: Error) {
