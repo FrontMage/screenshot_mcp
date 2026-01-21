@@ -39,6 +39,7 @@ struct Rect: Codable {
 }
 
 private let defaultRecordingFps = 10
+private let cliLogger = DebugLogger(source: "CLI")
 
 @main
 struct ScreenshotMcpCLI {
@@ -320,6 +321,7 @@ private func recordWindowAvailable(
     fps: Int,
     includeSystemAudio: Bool
 ) async throws {
+    cliLogger.info("record-window start windowId=\(windowId) fps=\(fps) systemAudio=\(includeSystemAudio) output=\(outputPath)")
     let url = URL(fileURLWithPath: outputPath)
     let dirUrl = url.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: dirUrl, withIntermediateDirectories: true, attributes: nil)
@@ -345,6 +347,7 @@ private func recordWindowAvailable(
 
     try await recorder.start()
     signalWatcher.stop()
+    cliLogger.info("record-window finished windowId=\(windowId)")
 }
 
 private func writeJSON<T: Encodable>(_ value: T) throws {
@@ -461,6 +464,10 @@ final class WindowFrameRecorder {
     private var baseTime = CMTime.zero
     private var audioCapture: AnyObject?
     private var recordingError: Error?
+    private var frameDropCount = 0
+    private var nilImageCount = 0
+    private var sizeMismatchCount = 0
+    private var audioSampleCount = 0
 
     init(windowId: CGWindowID, outputURL: URL, fps: Int, includeSystemAudio: Bool) {
         self.windowId = windowId
@@ -471,14 +478,17 @@ final class WindowFrameRecorder {
 
     func start() async throws {
         guard let firstImage = captureImage() else {
+            cliLogger.error("captureImage failed windowId=\(windowId)")
             throw CLIError("Unable to capture window \(windowId).")
         }
         width = firstImage.width
         height = firstImage.height
         if width <= 0 || height <= 0 {
+            cliLogger.error("invalid window size windowId=\(windowId) width=\(width) height=\(height)")
             throw CLIError("Window \(windowId) has invalid bounds.")
         }
 
+        cliLogger.info("record setup windowId=\(windowId) size=\(width)x\(height)")
         try setupWriter(width: width, height: height)
 
         let timer = DispatchSource.makeTimerSource(queue: captureQueue)
@@ -495,6 +505,7 @@ final class WindowFrameRecorder {
                     self?.handleAudioSample(sampleBuffer)
                 }
                 self.audioCapture = audioCapture
+                cliLogger.info("starting system audio capture windowId=\(windowId)")
                 try await audioCapture.start()
 
                 captureQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -553,8 +564,18 @@ final class WindowFrameRecorder {
         }
         writerQueue.async { [weak self] in
             guard let self = self else { return }
-            guard let image = self.captureImage() else { return }
+            guard let image = self.captureImage() else {
+                self.nilImageCount += 1
+                if self.nilImageCount % self.fps == 0 {
+                    cliLogger.error("captureImage returned nil windowId=\(self.windowId) count=\(self.nilImageCount)")
+                }
+                return
+            }
             if image.width != self.width || image.height != self.height {
+                self.sizeMismatchCount += 1
+                if self.sizeMismatchCount % self.fps == 0 {
+                    cliLogger.error("size mismatch windowId=\(self.windowId) count=\(self.sizeMismatchCount)")
+                }
                 return
             }
             if !self.writerStarted {
@@ -613,6 +634,7 @@ final class WindowFrameRecorder {
                 writer.add(audioInput)
                 self.audioInput = audioInput
             } else {
+                cliLogger.error("unable to add default audio input windowId=\(windowId)")
                 throw CLIError("Unable to add default audio input to writer.")
             }
         }
@@ -624,12 +646,21 @@ final class WindowFrameRecorder {
 
     private func appendFrame(image: CGImage, time: CMTime) {
         guard let input = input, let adaptor = adaptor else { return }
-        guard input.isReadyForMoreMediaData else { return }
+        guard input.isReadyForMoreMediaData else {
+            frameDropCount += 1
+            if frameDropCount % fps == 0 {
+                cliLogger.error("video backpressure windowId=\(windowId) drops=\(frameDropCount)")
+            }
+            return
+        }
         guard let pixelBuffer = makePixelBuffer(from: image, width: width, height: height) else {
             return
         }
         adaptor.append(pixelBuffer, withPresentationTime: time)
         frameCount += 1
+        if frameCount % Int64(fps) == 0 {
+            cliLogger.info("frameCount windowId=\(windowId) frames=\(frameCount)")
+        }
     }
 
     private func appendFrameWithNextTime(image: CGImage) {
@@ -673,6 +704,10 @@ final class WindowFrameRecorder {
             return
         }
         audioInput.append(sampleBuffer)
+        audioSampleCount += 1
+        if audioSampleCount % 100 == 0 {
+            cliLogger.info("audio samples windowId=\(windowId) count=\(audioSampleCount)")
+        }
     }
 
     private func setupAudioInput(using sampleBuffer: CMSampleBuffer) throws {
@@ -728,6 +763,7 @@ final class WindowFrameRecorder {
         baseTime = time
         writerStarted = true
         frameCount = 0
+        cliLogger.info("writer started windowId=\(windowId) baseTime=\(baseTime.seconds)")
     }
 
     private func appendInitialFrame(image: CGImage) {
@@ -857,3 +893,52 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 
 @available(macOS 13.0, *)
 extension SystemAudioCapture: @unchecked Sendable {}
+
+final class DebugLogger {
+    private let source: String
+    private let fileURL: URL
+    private let queue = DispatchQueue(label: "screenshot_mcp.cli.logger")
+    private let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+
+    init(source: String) {
+        self.source = source
+        let manager = FileManager.default
+        let documents = manager.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? manager.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
+        let logDir = documents.appendingPathComponent("screenshot_mcp")
+        self.fileURL = logDir.appendingPathComponent("debug.log")
+        try? manager.createDirectory(at: logDir, withIntermediateDirectories: true, attributes: nil)
+    }
+
+    func info(_ message: String) {
+        write(level: "INFO", message: message)
+    }
+
+    func error(_ message: String) {
+        write(level: "ERROR", message: message)
+    }
+
+    private func write(level: String, message: String) {
+        queue.async {
+            let timestamp = self.formatter.string(from: Date())
+            let line = "[\(timestamp)] [\(level)] [\(self.source)] \(message)\n"
+            if let data = line.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: self.fileURL.path) {
+                    if let handle = try? FileHandle(forWritingTo: self.fileURL) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        try? handle.close()
+                    }
+                } else {
+                    try? data.write(to: self.fileURL, options: .atomic)
+                }
+            }
+        }
+    }
+}
+
+extension DebugLogger: @unchecked Sendable {}
