@@ -551,14 +551,16 @@ final class WindowFrameRecorder {
         if stopRequested {
             return
         }
-        guard let image = captureImage() else {
-            return
-        }
-        if image.width != width || image.height != height {
-            return
-        }
         writerQueue.async { [weak self] in
-            self?.appendFrameWithNextTime(image: image)
+            guard let self = self else { return }
+            guard let image = self.captureImage() else { return }
+            if image.width != self.width || image.height != self.height {
+                return
+            }
+            if !self.writerStarted {
+                self.startWriterIfNeeded(at: .zero)
+            }
+            self.appendFrameWithNextTime(image: image)
         }
     }
 
@@ -597,6 +599,24 @@ final class WindowFrameRecorder {
         }
         writer.add(input)
 
+        if includeSystemAudio {
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 128_000
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput.expectsMediaDataInRealTime = true
+
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+                self.audioInput = audioInput
+            } else {
+                throw CLIError("Unable to add default audio input to writer.")
+            }
+        }
+
         self.writer = writer
         self.input = input
         self.adaptor = adaptor
@@ -613,7 +633,6 @@ final class WindowFrameRecorder {
     }
 
     private func appendFrameWithNextTime(image: CGImage) {
-        guard writerStarted else { return }
         let offset = CMTime(value: frameCount, timescale: CMTimeScale(fps))
         let time = CMTimeAdd(baseTime, offset)
         appendFrame(image: image, time: time)
@@ -659,6 +678,9 @@ final class WindowFrameRecorder {
     private func setupAudioInput(using sampleBuffer: CMSampleBuffer) throws {
         guard let writer = writer else {
             throw CLIError("Writer not initialized.")
+        }
+        if audioInput != nil {
+            return
         }
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
