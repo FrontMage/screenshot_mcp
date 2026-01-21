@@ -25,6 +25,9 @@ swift build
 swift run screenshot_mcp_app
 ```
 
+### Debug logs
+The SwiftUI app writes logs to `~/Documents/screenshot_mcp/debug.log` by default.
+
 ## MCP Tools
 - `list_displays`
 - `list_windows`
