@@ -19,6 +19,12 @@ swift build
 node server.js
 ```
 
+## SwiftUI UI (no Xcode)
+```bash
+swift build
+swift run screenshot_mcp_app
+```
+
 ## MCP Tools
 - `list_displays`
 - `list_windows`

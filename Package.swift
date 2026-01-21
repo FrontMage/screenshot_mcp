@@ -14,5 +14,8 @@ let package = Package(
         .executableTarget(
             name: "screenshot_mcp"
         ),
+        .executableTarget(
+            name: "screenshot_mcp_app"
+        ),
     ]
 )
