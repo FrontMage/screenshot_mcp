@@ -67,13 +67,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "record_window_duration",
       description:
-        "Record a window for a fixed duration (seconds) to an MP4. fps defaults to 10.",
+        "Record a window for a fixed duration (seconds) to an MP4. fps defaults to 10. system_audio records global system audio.",
       inputSchema: {
         type: "object",
         properties: {
           window_id: { type: "integer" },
           duration_seconds: { type: "number" },
           fps: { type: "integer" },
+          system_audio: { type: "boolean" },
           output_path: { type: "string" },
         },
         required: ["window_id", "duration_seconds"],
@@ -83,12 +84,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "record_window_start",
       description:
-        "Start recording a window until record_window_stop is called. fps defaults to 10.",
+        "Start recording a window until record_window_stop is called. fps defaults to 10. system_audio records global system audio.",
       inputSchema: {
         type: "object",
         properties: {
           window_id: { type: "integer" },
           fps: { type: "integer" },
+          system_audio: { type: "boolean" },
           output_path: { type: "string" },
         },
         required: ["window_id"],
@@ -166,6 +168,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error("duration_seconds must be a positive number.");
       }
       const fps = parseOptionalPositiveInt(args?.fps, "fps");
+      const systemAudio = parseOptionalBool(args?.system_audio, "system_audio");
       const outputPath =
         typeof args?.output_path === "string" && args.output_path.length > 0
           ? args.output_path
@@ -180,6 +183,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (fps !== null) {
         cliArgs.push(String(fps));
       }
+      if (systemAudio !== null) {
+        cliArgs.push(systemAudio ? "true" : "false");
+      }
       await runCli(cliArgs);
       return {
         content: [
@@ -193,6 +199,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error("window_id must be an integer.");
       }
       const fps = parseOptionalPositiveInt(args?.fps, "fps");
+      const systemAudio = parseOptionalBool(args?.system_audio, "system_audio");
       const outputPath =
         typeof args?.output_path === "string" && args.output_path.length > 0
           ? args.output_path
@@ -202,6 +209,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const cliArgs = ["record-window-start", String(windowId), outputPath];
       if (fps !== null) {
         cliArgs.push(String(fps));
+      }
+      if (systemAudio !== null) {
+        cliArgs.push(systemAudio ? "true" : "false");
       }
       const child = spawn(BIN_PATH, cliArgs, { stdio: "ignore" });
       activeRecordings.set(recordingId, { child, outputPath });
@@ -289,6 +299,16 @@ function parseOptionalPositiveInt(value, name) {
     throw new Error(`${name} must be a positive integer.`);
   }
   return parsed;
+}
+
+function parseOptionalBool(value, name) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`${name} must be a boolean.`);
+  }
+  return value;
 }
 
 function createRecordingId() {

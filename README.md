@@ -24,8 +24,8 @@ node server.js
 - `list_windows`
 - `screenshot_display` `{ display_id, output_path? }`
 - `screenshot_window` `{ window_id, output_path? }`
-- `record_window_duration` `{ window_id, duration_seconds, fps?, output_path? }`
-- `record_window_start` `{ window_id, fps?, output_path? }`
+- `record_window_duration` `{ window_id, duration_seconds, fps?, system_audio?, output_path? }`
+- `record_window_start` `{ window_id, fps?, system_audio?, output_path? }`
 - `record_window_stop` `{ recording_id }`
 
 ## CLI Usage
@@ -34,8 +34,8 @@ swift run screenshot_mcp list-displays
 swift run screenshot_mcp list-windows
 swift run screenshot_mcp screenshot-display <display_id> ./captures/display.png
 swift run screenshot_mcp screenshot-window <window_id> ./captures/window.png
-swift run screenshot_mcp record-window-duration <window_id> ./captures/window.mp4 5 10
-swift run screenshot_mcp record-window-start <window_id> ./captures/window.mp4 10
+swift run screenshot_mcp record-window-duration <window_id> ./captures/window.mp4 5 10 true
+swift run screenshot_mcp record-window-start <window_id> ./captures/window.mp4 10 true
 # stop with Ctrl+C or SIGINT
 ```
 
@@ -46,6 +46,7 @@ swift run screenshot_mcp record-window-start <window_id> ./captures/window.mp4 1
 ## Notes
 - The Swift CLI uses `CGDisplayCreateImage` and `CGWindowListCreateImage`.
 - Window recording samples window frames (default 10 fps) and writes MP4 via `AVAssetWriter`.
+- System audio capture requires macOS 13+ and records all system audio, not just the window.
 - If screenshots are blank, ensure Screen Recording permission is granted.
 
 ## License
