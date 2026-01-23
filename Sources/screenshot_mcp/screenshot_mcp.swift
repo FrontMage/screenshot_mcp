@@ -8,6 +8,9 @@ import CoreVideo
 import Dispatch
 import UniformTypeIdentifiers
 @preconcurrency import ScreenCaptureKit
+#if canImport(AppKit)
+import AppKit
+#endif
 
 struct DisplayInfo: Codable {
     let id: UInt32
@@ -41,6 +44,14 @@ struct Rect: Codable {
 private let defaultRecordingFps = 10
 private let cliLogger = DebugLogger(source: "CLI")
 
+@MainActor
+private func initializeWindowServerConnection() {
+    #if canImport(AppKit)
+    _ = NSApplication.shared
+    #endif
+    _ = CGMainDisplayID()
+}
+
 @main
 struct ScreenshotMcpCLI {
     static func main() async {
@@ -65,6 +76,9 @@ struct ScreenshotMcpCLI {
             try writeJSON(displays)
         case "list-windows":
             let windows = try listWindows()
+            try writeJSON(windows)
+        case "list-shareable-windows":
+            let windows = try await listShareableWindows()
             try writeJSON(windows)
         case "screenshot-display":
             guard args.count >= 3 else { printUsageAndExit() }
@@ -114,6 +128,7 @@ private func printUsage() {
         Usage:
           screenshot_mcp list-displays
           screenshot_mcp list-windows
+          screenshot_mcp list-shareable-windows
           screenshot_mcp screenshot-display <display_id> <output_path>
           screenshot_mcp screenshot-window <window_id> <output_path>
           screenshot_mcp record-window-duration <window_id> <output_path> <duration_seconds> [fps] [system_audio=true|false]
@@ -206,6 +221,40 @@ private func listWindows() throws -> [WindowInfo] {
             displayId: displayId
         )
     }
+}
+
+private func listShareableWindows() async throws -> [WindowInfo] {
+    if #available(macOS 13.0, *) {
+        await initializeWindowServerConnection()
+        let content = try await SCShareableContent.current
+        return content.windows.map { window in
+            let owner = window.owningApplication
+            let ownerPid: Int?
+            if let processID = owner?.processID {
+                ownerPid = Int(processID)
+            } else {
+                ownerPid = nil
+            }
+            let frame = window.frame
+            return WindowInfo(
+                windowId: Int(window.windowID),
+                ownerName: owner?.applicationName,
+                ownerPid: ownerPid,
+                title: window.title,
+                bounds: Rect(
+                    x: Double(frame.origin.x),
+                    y: Double(frame.origin.y),
+                    width: Double(frame.size.width),
+                    height: Double(frame.size.height)
+                ),
+                layer: nil,
+                isOnScreen: nil,
+                alpha: nil,
+                displayId: nil
+            )
+        }
+    }
+    throw CLIError("list-shareable-windows requires macOS 13 or later")
 }
 
 private func displayForWindow(bounds: Rect, displays: [DisplayInfo]) -> UInt32? {
@@ -325,13 +374,30 @@ private func recordWindowAvailable(
     let url = URL(fileURLWithPath: outputPath)
     let dirUrl = url.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: dirUrl, withIntermediateDirectories: true, attributes: nil)
+    if FileManager.default.fileExists(atPath: url.path) {
+        try FileManager.default.removeItem(at: url)
+        cliLogger.info("record-window removed existing output \(url.path)")
+    }
 
-    let recorder = WindowFrameRecorder(
-        windowId: CGWindowID(windowId),
-        outputURL: url,
-        fps: fps,
-        includeSystemAudio: includeSystemAudio
-    )
+    let recorder: RecordingController
+    if #available(macOS 13.0, *) {
+        recorder = WindowStreamRecorder(
+            windowId: CGWindowID(windowId),
+            outputURL: url,
+            fps: fps,
+            includeSystemAudio: includeSystemAudio
+        )
+    } else {
+        if includeSystemAudio {
+            throw CLIError("System audio recording requires macOS 13.0 or newer.")
+        }
+        recorder = WindowFrameRecorder(
+            windowId: CGWindowID(windowId),
+            outputURL: url,
+            fps: fps,
+            includeSystemAudio: includeSystemAudio
+        )
+    }
     let signalWatcher = SignalWatcher {
         recorder.requestStop()
     }
@@ -442,7 +508,13 @@ final class SignalWatcher {
 }
 
 @available(macOS 12.3, *)
-final class WindowFrameRecorder {
+protocol RecordingController: AnyObject {
+    func start() async throws
+    func requestStop()
+}
+
+@available(macOS 12.3, *)
+final class WindowFrameRecorder: RecordingController {
     private let windowId: CGWindowID
     private let outputURL: URL
     private let fps: Int
@@ -849,6 +921,841 @@ private func fourCC(_ code: UInt32) -> String {
         return "?"
     }.map(String.init).joined()
 }
+
+@available(macOS 13.0, *)
+final class WindowStreamRecorder: NSObject, SCStreamOutput, SCStreamDelegate, RecordingController {
+    private let windowId: CGWindowID
+    private let outputURL: URL
+    private let fps: Int
+    private let includeSystemAudio: Bool
+    private let writerQueue = DispatchQueue(label: "screenshot_mcp.stream_writer")
+    private var stream: SCStream?
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var writerStarted = false
+    private var stopRequested = false
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var recordingError: Error?
+    private var frameCount: Int64 = 0
+    private var audioSampleCount = 0
+    private var videoDropCount = 0
+    private var audioDropCount = 0
+    private var pendingVideoSample: CMSampleBuffer?
+    private var pendingAudioSample: CMSampleBuffer?
+    private var lastPixelBuffer: CVPixelBuffer?
+    private var lastVideoTime: CMTime = .invalid
+    private var frameStatusCounts: [Int: Int] = [:]
+    private var lastStatusLogTime: CFAbsoluteTime = 0
+
+    private enum FrameStatus: Int {
+        case complete = 0
+        case idle = 1
+        case blank = 2
+        case suspended = 3
+    }
+
+    init(windowId: CGWindowID, outputURL: URL, fps: Int, includeSystemAudio: Bool) {
+        self.windowId = windowId
+        self.outputURL = outputURL
+        self.fps = max(1, fps)
+        self.includeSystemAudio = includeSystemAudio
+        super.init()
+    }
+
+    private func evenDimension(_ value: Int) -> Int {
+        let adjusted = value - (value % 2)
+        return adjusted > 0 ? adjusted : value
+    }
+
+    func start() async throws {
+        await initializeWindowServerConnection()
+        let content = try await SCShareableContent.current
+        logShareableContentSummary(content)
+        guard let window = content.windows.first(where: { $0.windowID == windowId }) else {
+            throw CLIError("Window \(windowId) not found for stream capture.")
+        }
+
+        logWindowDiagnostics(window: window, allWindows: content.windows)
+
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let config = SCStreamConfiguration()
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        config.queueDepth = 6
+        config.capturesAudio = includeSystemAudio
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = false
+        if window.frame.width > 0, window.frame.height > 0 {
+            let targetWidth = Int(window.frame.width)
+            let targetHeight = Int(window.frame.height)
+            let evenWidth = evenDimension(targetWidth)
+            let evenHeight = evenDimension(targetHeight)
+            if evenWidth != targetWidth || evenHeight != targetHeight {
+                cliLogger.info(
+                    "stream resize windowId=\(windowId) from \(targetWidth)x\(targetHeight) to \(evenWidth)x\(evenHeight)"
+                )
+            }
+            config.width = evenWidth
+            config.height = evenHeight
+        }
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        self.stream = stream
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: writerQueue)
+        if includeSystemAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: writerQueue)
+        }
+
+        cliLogger.info("stream recorder start windowId=\(windowId) fps=\(fps) audio=\(includeSystemAudio)")
+        try await stream.startCapture()
+
+        await waitForStop()
+        try await stream.stopCapture()
+        try await finishWriting()
+
+        if let recordingError = recordingError {
+            throw recordingError
+        }
+    }
+
+    func requestStop() {
+        if stopRequested {
+            return
+        }
+        stopRequested = true
+        stopContinuation?.resume()
+        stopContinuation = nil
+    }
+
+    private func waitForStop() async {
+        await withCheckedContinuation { continuation in
+            stopContinuation = continuation
+            if stopRequested {
+                continuation.resume()
+                stopContinuation = nil
+            }
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        cliLogger.error("stream stopped windowId=\(windowId) error=\(error.localizedDescription)")
+        setError(error)
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard !stopRequested else { return }
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+
+        switch type {
+        case .screen:
+            handleVideoSample(sampleBuffer)
+        case .audio:
+            handleAudioSample(sampleBuffer)
+        default:
+            return
+        }
+    }
+
+    private func handleVideoSample(_ sampleBuffer: CMSampleBuffer) {
+        if recordingError != nil {
+            return
+        }
+
+        let status = frameStatus(from: sampleBuffer)
+        recordFrameStatus(status, sampleBuffer: sampleBuffer)
+        if let status = status, status != .complete {
+            handleNonCompleteVideoSample(sampleBuffer, status: status)
+            return
+        }
+
+        if includeSystemAudio, !writerStarted {
+            if pendingVideoSample == nil {
+                pendingVideoSample = sampleBuffer
+            }
+            if pendingAudioSample != nil {
+                startWriterWithPendingSamples()
+            }
+            return
+        }
+
+        do {
+            try ensureWriterForVideo(sampleBuffer)
+        } catch {
+            setError(error)
+            return
+        }
+
+        guard let videoInput = videoInput else { return }
+        if !writerStarted {
+            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            startWriterIfNeeded(at: time.isValid ? time : .zero)
+        }
+        appendVideoSample(sampleBuffer, to: videoInput)
+    }
+
+    private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        if recordingError != nil {
+            return
+        }
+        guard includeSystemAudio else { return }
+
+        if !writerStarted {
+            if pendingAudioSample == nil {
+                pendingAudioSample = sampleBuffer
+            }
+            if pendingVideoSample != nil {
+                startWriterWithPendingSamples()
+            }
+            return
+        }
+
+        guard let writer = writer, writer.status == .writing else {
+            return
+        }
+        if audioInput == nil {
+            do {
+                try setupAudioInput(using: sampleBuffer)
+            } catch {
+                setError(error)
+                return
+            }
+        }
+
+        guard let audioInput = audioInput else { return }
+        appendAudioSample(sampleBuffer, to: audioInput)
+    }
+
+    private func ensureWriterForVideo(_ sampleBuffer: CMSampleBuffer) throws {
+        if writer != nil {
+            return
+        }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+            throw CLIError("Missing video format description.")
+        }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        let width = Int(dimensions.width)
+        let height = Int(dimensions.height)
+        if width <= 0 || height <= 0 {
+            throw CLIError("Invalid video dimensions \(width)x\(height).")
+        }
+        if width % 2 != 0 || height % 2 != 0 {
+            cliLogger.error("odd video dimensions windowId=\(windowId) size=\(width)x\(height)")
+            throw CLIError("Video dimensions must be even: \(width)x\(height)")
+        }
+
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: settings,
+            sourceFormatHint: formatDescription
+        )
+        input.expectsMediaDataInRealTime = true
+        guard writer.canAdd(input) else {
+            throw CLIError("Unable to add video input to writer.")
+        }
+        writer.add(input)
+
+        let pixelFormat = CMFormatDescriptionGetMediaSubType(formatDescription)
+        let adaptorAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: adaptorAttributes
+        )
+
+        self.writer = writer
+        self.videoInput = input
+        self.adaptor = adaptor
+        cliLogger.info("stream writer setup windowId=\(windowId) size=\(width)x\(height)")
+    }
+
+    private func startWriterWithPendingSamples() {
+        guard let videoSample = pendingVideoSample else { return }
+        guard let audioSample = pendingAudioSample else { return }
+
+        do {
+            try ensureWriterForVideo(videoSample)
+            try setupAudioInput(using: audioSample)
+        } catch {
+            setError(error)
+            return
+        }
+
+        let videoTime = CMSampleBufferGetPresentationTimeStamp(videoSample)
+        let audioTime = CMSampleBufferGetPresentationTimeStamp(audioSample)
+        let startTime = min(videoTime, audioTime)
+        startWriterIfNeeded(at: startTime.isValid ? startTime : .zero)
+
+        if let videoInput = videoInput {
+            appendVideoSample(videoSample, to: videoInput)
+        }
+        if let audioInput = audioInput {
+            appendAudioSample(audioSample, to: audioInput)
+        }
+
+        pendingVideoSample = nil
+        pendingAudioSample = nil
+    }
+
+    private func appendVideoSample(_ sampleBuffer: CMSampleBuffer, to videoInput: AVAssetWriterInput) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            logMissingPixelBuffer(sampleBuffer)
+            return
+        }
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if appendPixelBuffer(pixelBuffer, at: time, videoInput: videoInput, sampleBuffer: sampleBuffer) {
+            stashLastPixelBuffer(from: pixelBuffer)
+        }
+    }
+
+    private func appendAudioSample(_ sampleBuffer: CMSampleBuffer, to audioInput: AVAssetWriterInput) {
+        guard audioInput.isReadyForMoreMediaData else {
+            audioDropCount += 1
+            if audioDropCount % 100 == 0 {
+                cliLogger.error("audio backpressure windowId=\(windowId) drops=\(audioDropCount)")
+            }
+            return
+        }
+        if audioInput.append(sampleBuffer) {
+            audioSampleCount += 1
+            if audioSampleCount % 100 == 0 {
+                cliLogger.info("stream audio samples windowId=\(windowId) count=\(audioSampleCount)")
+            }
+        } else {
+            logWriterFailure(kind: "audio", sampleBuffer: sampleBuffer, pixelBuffer: nil)
+        }
+    }
+
+    private func logWriterFailure(
+        kind: String,
+        sampleBuffer: CMSampleBuffer?,
+        pixelBuffer: CVPixelBuffer?
+    ) {
+        let writerStatus = writer?.status
+        let statusValue = writerStatus?.rawValue ?? -1
+        let statusText = writerStatus.map { String(describing: $0) } ?? "unknown"
+        let error = writer?.error as NSError?
+        let errorDesc = error?.localizedDescription ?? "Unknown error"
+        let errorDomain = error?.domain ?? "Unknown domain"
+        let errorCode = error?.code ?? -1
+        let errorInfo = error?.userInfo ?? [:]
+        cliLogger.error(
+            "\(kind) append failed windowId=\(windowId) status=\(statusValue) (\(statusText)) error=\(errorDesc) domain=\(errorDomain) code=\(errorCode) info=\(errorInfo)"
+        )
+
+        guard let sampleBuffer = sampleBuffer else {
+            return
+        }
+        let pts = timeString(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let dur = timeString(CMSampleBufferGetDuration(sampleBuffer))
+        let valid = CMSampleBufferIsValid(sampleBuffer)
+        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        let formatInfo = CMSampleBufferGetFormatDescription(sampleBuffer).map(formatDescriptionInfo) ?? "unknown"
+        let pixelInfo = pixelBuffer.map(pixelBufferInfo) ?? "none"
+        cliLogger.error(
+            "\(kind) sample windowId=\(windowId) pts=\(pts) dur=\(dur) valid=\(valid) samples=\(numSamples) format=\(formatInfo) pixel=\(pixelInfo)"
+        )
+    }
+
+    private func logMissingPixelBuffer(_ sampleBuffer: CMSampleBuffer) {
+        let pts = timeString(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let dur = timeString(CMSampleBufferGetDuration(sampleBuffer))
+        let valid = CMSampleBufferIsValid(sampleBuffer)
+        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        let formatInfo = CMSampleBufferGetFormatDescription(sampleBuffer).map(formatDescriptionInfo) ?? "unknown"
+        let dataLength: Int
+        if let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
+            dataLength = CMBlockBufferGetDataLength(dataBuffer)
+        } else {
+            dataLength = 0
+        }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+        let attachmentInfo = attachments.map { String(describing: $0) } ?? "none"
+        let parsed = parseSampleAttachments(attachments)
+        cliLogger.error(
+            "missing pixel buffer windowId=\(windowId) pts=\(pts) dur=\(dur) valid=\(valid) samples=\(numSamples) format=\(formatInfo) dataLength=\(dataLength) \(parsed) attachments=\(attachmentInfo)"
+        )
+    }
+
+    private func handleNonCompleteVideoSample(_ sampleBuffer: CMSampleBuffer, status: FrameStatus) {
+        guard status == .idle else {
+            return
+        }
+        guard writerStarted, let videoInput = videoInput else {
+            return
+        }
+        guard let lastPixelBuffer = lastPixelBuffer else {
+            return
+        }
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        _ = appendPixelBuffer(lastPixelBuffer, at: time, videoInput: videoInput, sampleBuffer: sampleBuffer)
+    }
+
+    private func appendPixelBuffer(
+        _ pixelBuffer: CVPixelBuffer,
+        at time: CMTime,
+        videoInput: AVAssetWriterInput,
+        sampleBuffer: CMSampleBuffer?
+    ) -> Bool {
+        guard let adaptor = adaptor else {
+            cliLogger.error("missing adaptor windowId=\(windowId)")
+            return false
+        }
+        guard videoInput.isReadyForMoreMediaData else {
+            videoDropCount += 1
+            if videoDropCount % fps == 0 {
+                cliLogger.error("video backpressure windowId=\(windowId) drops=\(videoDropCount)")
+            }
+            return false
+        }
+        let pts = time.isValid ? time : .zero
+        if lastVideoTime.isValid && pts <= lastVideoTime {
+            cliLogger.error(
+                "non-monotonic video pts windowId=\(windowId) pts=\(timeString(pts)) last=\(timeString(lastVideoTime))"
+            )
+            return false
+        }
+        if !adaptor.append(pixelBuffer, withPresentationTime: pts) {
+            logWriterFailure(kind: "video", sampleBuffer: sampleBuffer, pixelBuffer: pixelBuffer)
+            return false
+        }
+        lastVideoTime = pts
+        frameCount += 1
+        if frameCount % Int64(fps) == 0 {
+            cliLogger.info("stream frames windowId=\(windowId) count=\(frameCount)")
+        }
+        return true
+    }
+
+    private func stashLastPixelBuffer(from pixelBuffer: CVPixelBuffer) {
+        guard let copied = copyPixelBuffer(pixelBuffer) else {
+            return
+        }
+        lastPixelBuffer = copied
+    }
+
+    private func copyPixelBuffer(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        var copy: CVPixelBuffer?
+
+        if let pool = adaptor?.pixelBufferPool {
+            let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &copy)
+            if status != kCVReturnSuccess {
+                cliLogger.error("pixel buffer pool copy failed windowId=\(windowId) status=\(status)")
+                return nil
+            }
+        } else {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: format,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ]
+            let status = CVPixelBufferCreate(
+                nil,
+                width,
+                height,
+                format,
+                attrs as CFDictionary,
+                &copy
+            )
+            if status != kCVReturnSuccess {
+                cliLogger.error("pixel buffer copy failed windowId=\(windowId) status=\(status)")
+                return nil
+            }
+        }
+
+        guard let copyBuffer = copy else {
+            return nil
+        }
+        copyPixelBufferData(from: pixelBuffer, to: copyBuffer)
+        return copyBuffer
+    }
+
+    private func copyPixelBufferData(from source: CVPixelBuffer, to destination: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(destination, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        if CVPixelBufferIsPlanar(source) {
+            let planeCount = CVPixelBufferGetPlaneCount(source)
+            for plane in 0..<planeCount {
+                guard let srcBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                      let dstBase = CVPixelBufferGetBaseAddressOfPlane(destination, plane) else {
+                    continue
+                }
+                let srcBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+                let dstBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
+                let height = CVPixelBufferGetHeightOfPlane(source, plane)
+                let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
+                if rowBytes <= 0 || height <= 0 { continue }
+                for row in 0..<height {
+                    let srcPtr = srcBase.advanced(by: row * srcBytesPerRow)
+                    let dstPtr = dstBase.advanced(by: row * dstBytesPerRow)
+                    memcpy(dstPtr, srcPtr, rowBytes)
+                }
+            }
+        } else {
+            guard let srcBase = CVPixelBufferGetBaseAddress(source),
+                  let dstBase = CVPixelBufferGetBaseAddress(destination) else {
+                return
+            }
+            let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+            let dstBytesPerRow = CVPixelBufferGetBytesPerRow(destination)
+            let height = CVPixelBufferGetHeight(source)
+            let rowBytes = min(srcBytesPerRow, dstBytesPerRow)
+            if rowBytes <= 0 || height <= 0 { return }
+            for row in 0..<height {
+                let srcPtr = srcBase.advanced(by: row * srcBytesPerRow)
+                let dstPtr = dstBase.advanced(by: row * dstBytesPerRow)
+                memcpy(dstPtr, srcPtr, rowBytes)
+            }
+        }
+    }
+
+    private func parseSampleAttachments(_ attachments: CFArray?) -> String {
+        guard let attachments = attachments as? [[String: Any]], let first = attachments.first else {
+            return "attachmentParsed=none"
+        }
+        let statusKeys = [
+            "SCStreamUpdateFrameStatus",
+            "SCStreamFrameStatus",
+            "SCFrameStatus",
+            "SCStreamFrameInfoStatus",
+        ]
+        let displayTimeKeys = [
+            "SCStreamUpdateFrameDisplayTime",
+            "SCStreamFrameDisplayTime",
+            "SCFrameDisplayTime",
+            "SCStreamFrameInfoDisplayTime",
+        ]
+        let statusValue = statusKeys.compactMap { first[$0] }.first
+        let displayTimeValue = displayTimeKeys.compactMap { first[$0] }.first
+        let emptyMediaKey = "kCMSampleAttachmentKey_EmptyMedia"
+        let emptyMediaValue = first[emptyMediaKey]
+        return "attachmentParsed=status=\(String(describing: statusValue)) displayTime=\(String(describing: displayTimeValue)) emptyMedia=\(String(describing: emptyMediaValue))"
+    }
+
+    private func frameStatus(from sampleBuffer: CMSampleBuffer) -> FrameStatus? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+                as? [[String: Any]],
+              let first = attachments.first else {
+            return nil
+        }
+        let statusKeys = [
+            "SCStreamUpdateFrameStatus",
+            "SCStreamFrameStatus",
+            "SCFrameStatus",
+            "SCStreamFrameInfoStatus",
+        ]
+        for key in statusKeys {
+            if let value = first[key] {
+                let raw: Int?
+                if let number = value as? NSNumber {
+                    raw = number.intValue
+                } else if let intValue = value as? Int {
+                    raw = intValue
+                } else {
+                    raw = nil
+                }
+                if let raw = raw {
+                    return FrameStatus(rawValue: raw)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func recordFrameStatus(_ status: FrameStatus?, sampleBuffer: CMSampleBuffer) {
+        let rawValue = status?.rawValue ?? -1
+        frameStatusCounts[rawValue, default: 0] += 1
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastStatusLogTime == 0 {
+            lastStatusLogTime = now
+        }
+        if now - lastStatusLogTime < 5 {
+            return
+        }
+        let pts = timeString(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        let summary = frameStatusCounts
+            .sorted { $0.key < $1.key }
+            .map { "\(frameStatusName($0.key))=\($0.value)" }
+            .joined(separator: " ")
+        cliLogger.info("frame status windowId=\(windowId) pts=\(pts) \(summary)")
+        lastStatusLogTime = now
+    }
+
+    private func frameStatusName(_ rawValue: Int) -> String {
+        switch rawValue {
+        case FrameStatus.complete.rawValue:
+            return "complete"
+        case FrameStatus.idle.rawValue:
+            return "idle"
+        case FrameStatus.blank.rawValue:
+            return "blank"
+        case FrameStatus.suspended.rawValue:
+            return "suspended"
+        case -1:
+            return "unknown"
+        default:
+            return "status\(rawValue)"
+        }
+    }
+
+    private func logWindowDiagnostics(window: SCWindow, allWindows: [SCWindow]) {
+        let owner = window.owningApplication
+        let ownerName = owner?.applicationName ?? "unknown"
+        let ownerBundle = owner?.bundleIdentifier ?? "unknown"
+        let ownerPid = owner?.processID ?? 0
+        let title = window.title ?? ""
+        let frame = window.frame
+        cliLogger.info(
+            "stream target windowId=\(windowId) title=\(title) owner=\(ownerName) bundle=\(ownerBundle) pid=\(ownerPid) frame=\(Int(frame.origin.x))x\(Int(frame.origin.y)) \(Int(frame.size.width))x\(Int(frame.size.height))"
+        )
+
+        let sameOwner = allWindows.filter { $0.owningApplication?.processID == ownerPid }
+        if sameOwner.count > 1 {
+            let ids = sameOwner.map { String($0.windowID) }.joined(separator: ",")
+            cliLogger.info("stream owner windows pid=\(ownerPid) count=\(sameOwner.count) ids=\(ids)")
+            for candidate in sameOwner {
+                let title = candidate.title ?? ""
+                let frame = candidate.frame
+                cliLogger.info(
+                    "stream owner window windowId=\(candidate.windowID) title=\(title) frame=\(Int(frame.origin.x))x\(Int(frame.origin.y)) \(Int(frame.size.width))x\(Int(frame.size.height))"
+                )
+            }
+        }
+
+        logCgWindowsForOwner(ownerPid: Int(ownerPid), ownerName: ownerName)
+
+        if let windowInfoList = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowId) as? [[String: Any]],
+           let info = windowInfoList.first {
+            let ownerName = info[kCGWindowOwnerName as String] as? String ?? "unknown"
+            let title = info[kCGWindowName as String] as? String ?? ""
+            let layer = info[kCGWindowLayer as String] as? Int ?? -1
+            let isOnScreen = info[kCGWindowIsOnscreen as String] as? Bool
+            let alpha = info[kCGWindowAlpha as String] as? Double
+            let boundsText: String
+            if let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
+               let x = boundsDict["X"] as? Double,
+               let y = boundsDict["Y"] as? Double,
+               let width = boundsDict["Width"] as? Double,
+               let height = boundsDict["Height"] as? Double {
+                boundsText = "\(Int(x))x\(Int(y)) \(Int(width))x\(Int(height))"
+            } else {
+                boundsText = "unknown"
+            }
+            cliLogger.info(
+                "stream cgwindow windowId=\(windowId) title=\(title) owner=\(ownerName) layer=\(layer) onScreen=\(String(describing: isOnScreen)) alpha=\(String(describing: alpha)) bounds=\(boundsText)"
+            )
+        }
+    }
+
+    private func logCgWindowsForOwner(ownerPid: Int, ownerName: String) {
+        guard ownerPid > 0 else {
+            return
+        }
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windowInfoList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+            return
+        }
+        let ownerWindows = windowInfoList.filter { info in
+            (info[kCGWindowOwnerPID as String] as? Int) == ownerPid
+        }
+        guard !ownerWindows.isEmpty else {
+            return
+        }
+        let sorted = ownerWindows.sorted { windowAreaFromBounds($0) > windowAreaFromBounds($1) }
+        cliLogger.info("cgwindow owner windows pid=\(ownerPid) owner=\(ownerName) count=\(sorted.count)")
+        for info in sorted {
+            let windowId = info[kCGWindowNumber as String] as? Int ?? -1
+            let title = info[kCGWindowName as String] as? String ?? ""
+            let layer = info[kCGWindowLayer as String] as? Int ?? -1
+            let isOnScreen = info[kCGWindowIsOnscreen as String] as? Bool
+            let alpha = info[kCGWindowAlpha as String] as? Double
+            let boundsText: String
+            if let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
+               let x = boundsDict["X"] as? Double,
+               let y = boundsDict["Y"] as? Double,
+               let width = boundsDict["Width"] as? Double,
+               let height = boundsDict["Height"] as? Double {
+                boundsText = "\(Int(x))x\(Int(y)) \(Int(width))x\(Int(height))"
+            } else {
+                boundsText = "unknown"
+            }
+            cliLogger.info(
+                "cgwindow owner window windowId=\(windowId) title=\(title) layer=\(layer) onScreen=\(String(describing: isOnScreen)) alpha=\(String(describing: alpha)) bounds=\(boundsText)"
+            )
+        }
+    }
+
+    private func windowAreaFromBounds(_ info: [String: Any]) -> Double {
+        guard let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
+              let width = boundsDict["Width"] as? Double,
+              let height = boundsDict["Height"] as? Double else {
+            return 0
+        }
+        return max(0, width) * max(0, height)
+    }
+
+    private func logShareableContentSummary(_ content: SCShareableContent) {
+        cliLogger.info(
+            "shareable content windows=\(content.windows.count) displays=\(content.displays.count) apps=\(content.applications.count)"
+        )
+        let sortedWindows = content.windows.sorted { windowArea($0) > windowArea($1) }
+        for window in sortedWindows.prefix(12) {
+            let owner = window.owningApplication
+            let ownerName = owner?.applicationName ?? "unknown"
+            let ownerPid = owner?.processID ?? 0
+            let title = window.title ?? ""
+            let frame = window.frame
+            cliLogger.info(
+                "shareable window windowId=\(window.windowID) title=\(title) owner=\(ownerName) pid=\(ownerPid) frame=\(Int(frame.origin.x))x\(Int(frame.origin.y)) \(Int(frame.size.width))x\(Int(frame.size.height))"
+            )
+        }
+    }
+
+    private func windowArea(_ window: SCWindow) -> Double {
+        let frame = window.frame
+        return max(0, frame.size.width) * max(0, frame.size.height)
+    }
+
+    private func formatDescriptionInfo(_ formatDescription: CMFormatDescription) -> String {
+        let mediaType = CMFormatDescriptionGetMediaType(formatDescription)
+        let mediaSubType = CMFormatDescriptionGetMediaSubType(formatDescription)
+        var details = "type=\(fourCCString(mediaType)) subtype=\(fourCCString(mediaSubType))"
+        if mediaType == kCMMediaType_Video {
+            let dims = CMVideoFormatDescriptionGetDimensions(formatDescription)
+            details += " \(dims.width)x\(dims.height)"
+        }
+        return details
+    }
+
+    private func pixelBufferInfo(_ pixelBuffer: CVPixelBuffer) -> String {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        return "\(width)x\(height) format=\(fourCCString(format))"
+    }
+
+    private func timeString(_ time: CMTime) -> String {
+        guard time.isValid else {
+            return "invalid"
+        }
+        guard time.isNumeric else {
+            return "non-numeric"
+        }
+        return String(format: "%.6f", CMTimeGetSeconds(time))
+    }
+
+    private func fourCCString(_ value: OSType) -> String {
+        let bytes = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+        ]
+        if let string = String(bytes: bytes, encoding: .macOSRoman) {
+            let trimmed = string.trimmingCharacters(in: .controlCharacters)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return String(format: "0x%08X", value)
+    }
+
+    private func setupAudioInput(using sampleBuffer: CMSampleBuffer) throws {
+        guard let writer = writer else {
+            return
+        }
+        if audioInput != nil {
+            return
+        }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
+            throw CLIError("Unable to read audio format description.")
+        }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: asbd.mSampleRate,
+            AVNumberOfChannelsKey: Int(asbd.mChannelsPerFrame),
+            AVEncoderBitRateKey: 128_000
+        ]
+
+        var audioInput = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: settings,
+            sourceFormatHint: formatDescription
+        )
+        audioInput.expectsMediaDataInRealTime = true
+
+        if !writer.canAdd(audioInput) {
+            audioInput = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: nil,
+                sourceFormatHint: formatDescription
+            )
+            audioInput.expectsMediaDataInRealTime = true
+        }
+
+        guard writer.canAdd(audioInput) else {
+            let formatID = fourCC(asbd.mFormatID)
+            throw CLIError(
+                "Unable to add audio input to writer. format=\(formatID) " +
+                "sampleRate=\(asbd.mSampleRate) channels=\(asbd.mChannelsPerFrame)"
+            )
+        }
+        writer.add(audioInput)
+        self.audioInput = audioInput
+    }
+
+    private func startWriterIfNeeded(at time: CMTime) {
+        guard let writer = writer, !writerStarted else { return }
+        writer.startWriting()
+        writer.startSession(atSourceTime: time)
+        writerStarted = true
+        cliLogger.info("stream writer started windowId=\(windowId) baseTime=\(time.seconds)")
+    }
+
+    private func finishWriting() async throws {
+        guard let writer = writer else {
+            throw CLIError("No video frames captured for window \(windowId).")
+        }
+        videoInput?.markAsFinished()
+        audioInput?.markAsFinished()
+        await withCheckedContinuation { continuation in
+            writer.finishWriting {
+                continuation.resume()
+            }
+        }
+        if writer.status == .failed {
+            let message = writer.error?.localizedDescription ?? "Unknown error"
+            throw CLIError("Recording failed: \(message)")
+        }
+    }
+
+    private func setError(_ error: Error) {
+        recordingError = error
+        requestStop()
+    }
+}
+
+@available(macOS 13.0, *)
+extension WindowStreamRecorder: @unchecked Sendable {}
 
 @available(macOS 13.0, *)
 final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
